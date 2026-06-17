@@ -311,10 +311,6 @@ CFG = {
 
 ---
 
-Column definitions shared across grid result files: `period`, `n_qubits`, `n_layers`, `n_reservoirs`, `seeds`, `n_features`, `best_alpha`, `rmse`, `qlike`, `mz_alpha`, `mz_beta`, `mz_r2`, `train_size`, `test_size`.
-
----
-
 ## Citation
 
 If you use this code or results in your research, please cite.
