@@ -147,12 +147,6 @@ def fit_esn(vol, targets, split, lookback):
     vol     — raw vol input feature
     targets — log vol (from get_data); ESN trains and predicts in log space
 
-    Two fixes vs the raw-vol version:
-      1. StandardScaler on vol (fit on train only) — reservoir needs unit-variance
-         inputs; raw vol (~0.004) is too small to drive meaningful tanh activations.
-      2. Bias column appended to reservoir states — without it the readout is
-         constrained to output near zero and cannot shift to log-vol range (~-5 to -6).
-
     Alignment (same proof as LSTM):
       yl[i] = targets[i + lookback],  ls = split - lookback
       → yl[ls] = targets[split] = y_test[0]
@@ -227,7 +221,7 @@ def fit_lstm(vol, targets, split, lookback):
     from tensorflow.keras.layers import LSTM, Dense, Dropout
     from tensorflow.keras.callbacks import EarlyStopping
 
-    # Scale vol input — fit on train split only to avoid data leakage
+   
     scaler = StandardScaler()
     scaler.fit(vol[:split].reshape(-1, 1))
     vol_sc = scaler.transform(vol.reshape(-1, 1)).flatten()
@@ -242,7 +236,7 @@ def fit_lstm(vol, targets, split, lookback):
     X_tr = Xl[:ls].reshape(-1, lookback, 1)
     X_te = Xl[ls:].reshape(-1, lookback, 1)
     y_tr = yl[:ls]
-    y_te = yl[ls:]   # aligned: y_te[0] == targets[split] == y_test[0]
+    y_te = yl[ls:]   
 
     tf.keras.backend.clear_session()
     tf.random.set_seed(42)
