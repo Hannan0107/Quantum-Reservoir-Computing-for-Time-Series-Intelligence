@@ -9,7 +9,7 @@ Three simulation backends, selectable at QuantumReservoir construction time:
   backend="aer_noise"     — AerSimulator + NoiseModel
                             (depolarizing gate error + readout error, both controllable)
 
-Public API is unchanged from the original:
+Functions:
   build_observables(n_qubits)                          → list[SparsePauliOp]
   QuantumReservoir(n_qubits, n_layers, seeds, ...)
       .get_combined_latent(input_sequence)             → np.ndarray
