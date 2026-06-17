@@ -62,7 +62,7 @@ RUN_MODE = "noise_sweep"   # "grid"  or  "noise_sweep"
 # MANUAL CONFIGURATION
 # ============================================================
 CFG = {
-    "ticker":           "GLD",
+    "ticker":           "SPY",    # change manually (QQQ, GLD)
     "n_qubits":         4,        # change manually (e.g. 4, 6, 8, 10)
     "lookback":         5,
     "hankel_window":    3,
