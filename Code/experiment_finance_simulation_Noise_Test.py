@@ -4,7 +4,7 @@ experiment_finance_simulation_QQQ.py
 
 Pipeline
 --------
-  1. Download GLD price data via yfinance
+  1. Load price data from the local snapshot (market_data.py)
   2. Compute daily returns and rolling log-volatility targets
   3. Extract Hankel-stacked quantum reservoir features
   4. Fit RidgeCV readout in log-vol space
@@ -41,12 +41,12 @@ import warnings
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-import yfinance as yf
 from sklearn.linear_model import RidgeCV
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
+from market_data import DATA_DIR, load_close
 from qrc_core import QuantumReservoir, prepare_hankel_features
 
 warnings.filterwarnings("ignore")
@@ -69,6 +69,7 @@ CFG = {
     "forecast_horizon": 5,
     "train_split":      0.8,
     "seed":             42,
+    "data_dir":         DATA_DIR,  # price snapshots (see market_data.py)
 }
 
 PERIOD_STARTS = {
@@ -120,7 +121,7 @@ NOISE_RESULTS_FILE = f"qrc_noise_sweep_q{CFG['n_qubits']}_QQQ.csv"
 
 
 # ============================================================
-# DATA  (cached so yfinance is not hit repeatedly)
+# DATA  (local snapshot, cached per period)
 # ============================================================
 _data_cache: dict = {}
 
@@ -129,17 +130,7 @@ def get_market_data(period: str):
     if period in _data_cache:
         return _data_cache[period]
 
-    df = yf.download(
-        CFG["ticker"],
-        start=PERIOD_STARTS[period],
-        end=END_DATE,
-        interval="1d",
-        progress=False,
-    )
-    if df.empty:
-        raise ValueError(f"No data for {CFG['ticker']} period={period}.")
-
-    close   = df["Close"].values.flatten()
+    close   = load_close(CFG["ticker"], PERIOD_STARTS[period], END_DATE, CFG["data_dir"]).values
     returns = np.diff(close) / close[:-1]
 
     vol_window = 5

@@ -1,23 +1,47 @@
 # -*- coding: utf-8 -*-
 
 # CLASSICAL TEST CODE:
+#
+# Protocol (matches experiment_finance_simulation.py):
+#   train      = [0,          VAL_SPLIT)
+#   validation = [VAL_SPLIT,  TRAIN_SPLIT)  → selects ESN / LSTM lookback (min val QLIKE)
+#   test       = [TRAIN_SPLIT, 1]           → selected models refit on train+val,
+#                                             evaluated over SEEDS (mean ± std)
+# GARCH(1,1) and HAR have no hyperparameters to select and are deterministic,
+# so they are evaluated once on test.
+#
+# Purging: targets[k] spans returns[k:k+5], so the last FORECAST_HORIZON-1
+# training targets overlap the first evaluation targets. Those PURGE_GAP
+# samples are dropped from every readout / regression fit.
+#
+# Usage (CLI flags override the defaults below):
+#   py -3.11 benchmark_classical.py --ticker SPY
+#   py -3.11 benchmark_classical.py --ticker GLD --periods 1y 4y
+# Prices come from the local snapshot in market_data.py ({data_dir}/{ticker}_close.csv).
 
+import argparse
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import warnings
 import statsmodels.api as sm
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import StandardScaler
+
+from market_data import DATA_DIR, load_close
 
 warnings.filterwarnings('ignore')
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-TICKER           = "SPY"  # Change to QQQ, GLD manually
+TICKER           = "SPY"  # default; override with --ticker
 FORECAST_HORIZON = 5
-TRAIN_SPLIT      = 0.8
+VAL_SPLIT        = 0.6    # validation starts here
+TRAIN_SPLIT      = 0.8    # test starts here (unchanged from original protocol)
+PURGE_GAP        = FORECAST_HORIZON - 1   # training samples dropped before each split
+
+# Seeds for the stochastic baselines (ESN weights, LSTM init/dropout)
+SEEDS = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
 
 # Lookback windows applied to BOTH ESN and LSTM:
 #   1  → ESN default (single-step input, current baseline)
@@ -25,6 +49,9 @@ TRAIN_SPLIT      = 0.8
 #   7  → matches QRC effective memory (lookback + hankel_window - 1 = 5+3-1)
 #   21 → standard ~1-month financial window
 LOOKBACKS = [1, 5, 7, 21]
+
+# HAR components (Corsi, 2009): daily, weekly, monthly
+HAR_LAGS = (1, 5, 22)
 
 PERIOD_STARTS = {
     "1y":  "2024-02-07",
@@ -39,6 +66,23 @@ PERIOD_STARTS = {
     "10y": "2015-04-27",
 }
 END_DATE = "2025-01-01"
+
+# ── CLI overrides ────────────────────────────────────────────
+_parser = argparse.ArgumentParser(description="Classical volatility baselines (GARCH, HAR, ESN, LSTM).")
+_parser.add_argument("--ticker", default=TICKER, help="e.g. SPY, QQQ, GLD")
+_parser.add_argument("--periods", nargs="+", choices=list(PERIOD_STARTS), default=list(PERIOD_STARTS),
+                     help="subset of data periods to run")
+_parser.add_argument("--data-dir", default=DATA_DIR, help="price snapshot directory")
+_args = _parser.parse_args()
+
+TICKER   = _args.ticker.upper()
+PERIODS  = _args.periods
+DATA_DIR = _args.data_dir
+
+RESULTS_FILE     = f"benchmark_logvol_results_{TICKER}.csv"
+SUMMARY_FILE     = f"benchmark_logvol_summary_{TICKER}.csv"
+VAL_FILE         = f"benchmark_validation_{TICKER}.csv"
+PREDICTIONS_FILE = f"classical_predictions_{TICKER}.csv"
 
 
 # ============================================================
@@ -69,34 +113,35 @@ def evaluate(name, y_test, preds):
 # DATA — targets = log(raw_vol)
 # ============================================================
 def get_data(period: str):
-    df = yf.download(
-        TICKER,
-        start=PERIOD_STARTS[period],
-        end=END_DATE,
-        interval="1d",
-        progress=False,
-    )
-    if df.empty:
-        raise ValueError(f"No data for {TICKER} period={period}.")
+    """
+    Returns (returns, vol, targets, target_dates).
 
-    close   = df['Close'].values.flatten()
+    target_dates[k] is the last trading day of the 5-day window that
+    targets[k] measures — the same convention as the QRC script, so
+    forecasts from both pipelines can be matched by date for DM tests.
+    """
+    close_s = load_close(TICKER, PERIOD_STARTS[period], END_DATE, DATA_DIR)
+    close   = close_s.values
     returns = np.diff(close) / close[:-1]
 
     vol_window = 5
     vol = np.array([np.std(returns[i - vol_window:i])
                     for i in range(vol_window, len(returns))])
+    # vol[j] covers returns[j:j+5]; its last return is dated close_s.index[j+5]
+    vol_dates = close_s.index[vol_window:vol_window + len(vol)].strftime("%Y-%m-%d").values
 
     returns = returns[vol_window:]
     min_len = min(len(returns), len(vol))
     returns, vol = returns[:min_len], vol[:min_len]
 
     # Log-transform targets to match QRC pipeline
-    targets = np.log(np.clip(vol[FORECAST_HORIZON:], 1e-10, None))
-    vol     = vol[:-FORECAST_HORIZON]
-    returns = returns[:-FORECAST_HORIZON]
+    targets      = np.log(np.clip(vol[FORECAST_HORIZON:], 1e-10, None))
+    target_dates = vol_dates[FORECAST_HORIZON:min_len]
+    vol          = vol[:-FORECAST_HORIZON]
+    returns      = returns[:-FORECAST_HORIZON]
 
     mask = ~(np.isnan(returns) | np.isnan(vol) | np.isnan(targets))
-    return returns[mask], vol[mask], targets[mask]
+    return returns[mask], vol[mask], targets[mask], target_dates[mask]
 
 
 # ============================================================
@@ -140,16 +185,18 @@ class EchoStateNetwork:
         return np.array(preds)
 
 
-def fit_esn(vol, targets, split, lookback):
+def fit_esn(vol, targets, split, lookback, seed=42):
     """
     Training and predicting ESN with a given lookback window.
 
     vol     — raw vol input feature
     targets — log vol (from get_data); ESN trains and predicts in log space
+    seed    — reservoir weight seed
 
     Alignment (same proof as LSTM):
-      yl[i] = targets[i + lookback],  ls = split - lookback
-      → yl[ls] = targets[split] = y_test[0]
+      window i = vol[i-lookback+1 : i+1]  (ends at vol[i], info up to returns[i-1])
+      yw[j] = targets[j + lookback - 1],  ls = split - lookback + 1
+      → yw[ls] = targets[split] = y_test[0]
     """
     # Scale vol input — fit on train only to avoid data leakage
     scaler      = StandardScaler()
@@ -157,27 +204,30 @@ def fit_esn(vol, targets, split, lookback):
     vol_sc_full = scaler.transform(vol.reshape(-1, 1)).flatten()
 
     if lookback == 1:
-        # Original single-step ESN — feed full sequence, recurrent memory intact
-        esn = EchoStateNetwork()
-        esn.fit(vol_sc_full[:split].reshape(-1, 1), targets[:split])
-        preds = esn.predict(vol_sc_full[split:].reshape(-1, 1))
+        # Original single-step ESN — feed full sequence, recurrent memory intact.
+        # Readout is fit on [0, split - PURGE_GAP); the purged steps still run
+        # through the reservoir so the state entering the test window is current.
+        fit_end = split - PURGE_GAP
+        esn = EchoStateNetwork(seed=seed)
+        esn.fit(vol_sc_full[:fit_end].reshape(-1, 1), targets[:fit_end])
+        preds = esn.predict(vol_sc_full[fit_end:].reshape(-1, 1))[PURGE_GAP:]
         y_te  = targets[split:]
     else:
         # Windowed ESN — mirrors LSTM windowing for fair comparison
         Xw, yw = [], []
-        for i in range(lookback, len(vol_sc_full)):
-            Xw.append(vol_sc_full[i - lookback:i])
+        for i in range(lookback - 1, len(vol_sc_full)):
+            Xw.append(vol_sc_full[i - lookback + 1:i + 1])
             yw.append(targets[i])
         Xw, yw = np.array(Xw), np.array(yw)
 
-        ls   = split - lookback
-        X_tr = Xw[:ls]
+        ls   = split - lookback + 1
+        X_tr = Xw[:ls - PURGE_GAP]
         X_te = Xw[ls:]
-        y_tr = yw[:ls]
+        y_tr = yw[:ls - PURGE_GAP]
         y_te = yw[ls:]   # aligned: y_te[0] == targets[split] == y_test[0]
 
         # Train: run each window through reservoir, collect final states + bias
-        esn = EchoStateNetwork()
+        esn = EchoStateNetwork(seed=seed)
         train_states = []
         for window in X_tr:
             x = np.zeros(esn.n_res)
@@ -204,16 +254,18 @@ def fit_esn(vol, targets, split, lookback):
 # ============================================================
 # LSTM HELPER
 # ============================================================
-def fit_lstm(vol, targets, split, lookback):
+def fit_lstm(vol, targets, split, lookback, seed=42):
     """
     Training and predicting LSTM with a given lookback window.
 
     vol     — raw vol input feature
     targets — log vol (from get_data); LSTM trains and predicts in log space
+    seed    — seeds Python, NumPy and TensorFlow (weight init, dropout, shuffling)
 
     Alignment proof:
-      yl[i] = targets[i + lookback]  (loop starts at range(lookback, ...))
-      ls    = split - lookback
+      window i = vol[i-lookback+1 : i+1]  (ends at vol[i], info up to returns[i-1])
+      yl[j] = targets[j + lookback - 1]   (loop starts at range(lookback - 1, ...))
+      ls    = split - lookback + 1
       yl[ls]= targets[split] = y_test[0]  offset cancels exactly
     """
     import tensorflow as tf
@@ -221,25 +273,25 @@ def fit_lstm(vol, targets, split, lookback):
     from tensorflow.keras.layers import LSTM, Dense, Dropout
     from tensorflow.keras.callbacks import EarlyStopping
 
-   
+
     scaler = StandardScaler()
     scaler.fit(vol[:split].reshape(-1, 1))
     vol_sc = scaler.transform(vol.reshape(-1, 1)).flatten()
 
     Xl, yl = [], []
-    for i in range(lookback, len(vol_sc)):
-        Xl.append(vol_sc[i - lookback:i])
+    for i in range(lookback - 1, len(vol_sc)):
+        Xl.append(vol_sc[i - lookback + 1:i + 1])
         yl.append(targets[i])
     Xl, yl = np.array(Xl), np.array(yl)
 
-    ls   = split - lookback
-    X_tr = Xl[:ls].reshape(-1, lookback, 1)
+    ls   = split - lookback + 1
+    X_tr = Xl[:ls - PURGE_GAP].reshape(-1, lookback, 1)
     X_te = Xl[ls:].reshape(-1, lookback, 1)
-    y_tr = yl[:ls]
-    y_te = yl[ls:]   
+    y_tr = yl[:ls - PURGE_GAP]
+    y_te = yl[ls:]
 
     tf.keras.backend.clear_session()
-    tf.random.set_seed(42)
+    tf.keras.utils.set_random_seed(seed)
 
     mdl = Sequential([
         LSTM(64, input_shape=(lookback, 1)),
@@ -259,31 +311,93 @@ def fit_lstm(vol, targets, split, lookback):
 
 
 # ============================================================
+# HAR (log-HAR on squared daily returns)
+# ============================================================
+def har_features(returns):
+    """
+    Row k = log of the mean squared return over the 1 / 5 / 22 days strictly
+    before index k (returns[k-lag:k]).
+
+    targets[k] measures returns[k:k+5] (see get_data), so features and target
+    never overlap. Rows with fewer than max(HAR_LAGS) days of history are NaN.
+    """
+    r2   = returns ** 2
+    csum = np.concatenate([[0.0], np.cumsum(r2)])
+    X    = np.full((len(returns), len(HAR_LAGS)), np.nan)
+    for j, lag in enumerate(HAR_LAGS):
+        k       = np.arange(lag, len(returns))
+        X[k, j] = (csum[k] - csum[k - lag]) / lag
+    return np.log(np.clip(X, 1e-12, None))
+
+
+def fit_har(returns, targets, split):
+    """
+    log σ_{t+1:t+5} = b0 + b_d log RV_d + b_w log RV_w + b_m log RV_m,
+    fit by OLS on [max(HAR_LAGS), split - PURGE_GAP); predicts [split, end) in log space.
+    """
+    X     = har_features(returns)
+    tr    = np.arange(max(HAR_LAGS), split - PURGE_GAP)
+    ols   = sm.OLS(targets[tr], sm.add_constant(X[tr])).fit()
+    preds = ols.predict(sm.add_constant(X[split:], has_constant='add'))
+    return preds, targets[split:]
+
+
+# ============================================================
 # MAIN LOOP
 # ============================================================
 from arch import arch_model
 
-all_results = []
+NAN_METRICS = {"RMSE": np.nan, "QLIKE": np.nan,
+               "MZ_alpha": np.nan, "MZ_beta": np.nan, "MZ_R2": np.nan}
+FITTERS     = {"ESN": fit_esn, "LSTM": fit_lstm}
 
-for period in PERIOD_STARTS:
+
+def print_metrics(r):
+    print(f"    RMSE={r['RMSE']:.6f}  QLIKE={r['QLIKE']:.6f}  "
+          f"MZ_β={r['MZ_beta']:.4f}  R²={r['MZ_R2']:.4f}")
+
+
+all_results     = []   # test metrics, one row per (period, model, seed)
+val_results     = []   # validation metrics, one row per (period, model, lookback)
+all_predictions = []   # per-date test forecasts for DM tests
+
+for period in PERIODS:
     print(f"\n{'#'*60}")
     print(f"  PERIOD: {period}  ({PERIOD_STARTS[period]} → {END_DATE})")
     print(f"{'#'*60}")
 
     try:
-        returns, vol, targets = get_data(period)
+        returns, vol, targets, dates = get_data(period)
     except Exception as e:
         print(f"  Data error: {e}")
         continue
 
-    split  = int(len(vol) * TRAIN_SPLIT)
-    y_test = targets[split:]   # log vol
-    print(f"  Samples: {len(vol)}  |  Train: {split}  |  Test: {len(y_test)}")
+    val_split  = int(len(vol) * VAL_SPLIT)
+    split      = int(len(vol) * TRAIN_SPLIT)
+    y_test     = targets[split:]   # log vol
+    test_dates = dates[split:]
+    print(f"  Samples: {len(vol)}  |  Train: {val_split}  |  "
+          f"Val: {split - val_split}  |  Test: {len(y_test)}")
 
-    period_results = []
+    def record_test(model, preds, y_te, seed=np.nan, lookback=np.nan):
+        """Evaluate one test forecast; store metrics and per-date predictions."""
+        n = min(len(preds), len(y_te))
+        r = evaluate(model, y_te[:n], preds[:n])
+        r.update(period=period, seed=seed, lookback=lookback)
+        all_results.append(r)
+        all_predictions.extend(
+            {"ticker": TICKER, "period": period, "model": model, "seed": seed,
+             "date": d, "y_true_log": yt, "y_pred_log": yp}
+            for d, yt, yp in zip(test_dates[:n], y_te[:n], preds[:n])
+        )
+        print_metrics(r)
 
     # ── GARCH ──────────────────────────────────────────────
-    # GARCH always outputs raw vol — log-transform before evaluate()
+    # GARCH always outputs raw vol — log-transform before evaluate().
+    # Target is vol over the next FORECAST_HORIZON days, so the matching forecast
+    # is sqrt of the mean conditional variance over steps 1..h.
+    # GARCH is fit on returns up to the forecast origin only — no target overlap,
+    # so no purge needed.
     print(f"  Fitting GARCH(1,1)...")
     full_r      = returns * 100
     garch_preds = []
@@ -292,96 +406,99 @@ for period in PERIOD_STARTS:
             m   = arch_model(full_r[:i], vol='Garch', p=1, q=1, dist='normal')
             res = m.fit(disp='off', show_warning=False)
             fc  = res.forecast(horizon=FORECAST_HORIZON)
-            garch_preds.append(np.sqrt(fc.variance.values[-1, -1]) / 100)
+            garch_preds.append(np.sqrt(fc.variance.values[-1, :].mean()) / 100)
         except Exception:
             garch_preds.append(np.nan)
-    garch_preds     = np.array(garch_preds)
-    garch_preds_log = np.log(np.clip(garch_preds, 1e-10, None))
-    min_len         = min(len(garch_preds_log), len(y_test))
-    r               = evaluate("GARCH(1,1)", y_test[:min_len], garch_preds_log[:min_len])
-    r["period"] = period
-    period_results.append(r)
-    print(f"    RMSE={r['RMSE']:.6f}  QLIKE={r['QLIKE']:.6f}  "
-          f"MZ_β={r['MZ_beta']:.4f}  R²={r['MZ_R2']:.4f}")
+    garch_preds_log = np.log(np.clip(np.array(garch_preds), 1e-10, None))
+    record_test("GARCH(1,1)", garch_preds_log, y_test)
 
-    # ── ESN + LSTM (all lookbacks) ─────────────────────────
-    # targets are already log vol; predictions come out in log space naturally
+    # ── HAR ────────────────────────────────────────────────
+    print(f"  Fitting HAR...")
+    har_preds, y_te = fit_har(returns, targets, split)
+    record_test("HAR", har_preds, y_te)
+
+    # ── ESN + LSTM: lookback selection on validation ───────
+    # Fit on train only (data truncated at `split`, so the "test" portion
+    # returned by the fitters is the validation window).
     for lb in LOOKBACKS:
-        # ESN
-        label = f"ESN(lb={lb})"
-        print(f"  Fitting {label}...")
-        try:
-            esn_preds, y_te = fit_esn(vol, targets, split, lb)
-            min_len         = min(len(esn_preds), len(y_te))
-            r               = evaluate(label, y_te[:min_len], esn_preds[:min_len])
-        except Exception as e:
-            print(f"    ERROR: {e}")
-            r = {"model": label, "RMSE": np.nan, "QLIKE": np.nan,
-                 "MZ_alpha": np.nan, "MZ_beta": np.nan, "MZ_R2": np.nan}
-        r["period"] = period
-        period_results.append(r)
-        print(f"    RMSE={r['RMSE']:.6f}  QLIKE={r['QLIKE']:.6f}  "
-              f"MZ_β={r['MZ_beta']:.4f}  R²={r['MZ_R2']:.4f}")
+        for family, fit in FITTERS.items():
+            # LSTM skips lb=1 — LSTM needs at least a small sequence
+            if family == "LSTM" and lb == 1:
+                continue
+            print(f"  [val] {family}(lb={lb})...")
+            try:
+                p, y_v = fit(vol[:split], targets[:split], val_split, lb, seed=SEEDS[0])
+                n      = min(len(p), len(y_v))
+                r      = evaluate(family, y_v[:n], p[:n])
+            except Exception as e:
+                print(f"    ERROR: {e}")
+                r = {"model": family, **NAN_METRICS}
+            r.update(period=period, lookback=lb)
+            val_results.append(r)
+            print_metrics(r)
 
-        # LSTM (skip lb=1 — LSTM needs at least a small sequence)
-        if lb == 1:
+    # ── ESN + LSTM: selected lookback, all seeds, on test ──
+    val_df = pd.DataFrame([r for r in val_results if r["period"] == period])
+    for family, fit in FITTERS.items():
+        fam_val = val_df[val_df["model"] == family].dropna(subset=["QLIKE"])
+        if fam_val.empty:
+            print(f"  No valid {family} lookback on validation — skipping test.")
             continue
-        label = f"LSTM(lb={lb})"
-        print(f"  Fitting {label}...")
-        try:
-            lstm_preds, y_te = fit_lstm(vol, targets, split, lb)
-            min_len          = min(len(lstm_preds), len(y_te))
-            r                = evaluate(label, y_te[:min_len], lstm_preds[:min_len])
-        except Exception as e:
-            print(f"    ERROR: {e}")
-            r = {"model": label, "RMSE": np.nan, "QLIKE": np.nan,
-                 "MZ_alpha": np.nan, "MZ_beta": np.nan, "MZ_R2": np.nan}
-        r["period"] = period
-        period_results.append(r)
-        print(f"    RMSE={r['RMSE']:.6f}  QLIKE={r['QLIKE']:.6f}  "
-              f"MZ_β={r['MZ_beta']:.4f}  R²={r['MZ_R2']:.4f}")
-
-    all_results.extend(period_results)
+        best_lb = int(fam_val.loc[fam_val["QLIKE"].idxmin(), "lookback"])
+        print(f"  {family}: selected lb={best_lb} (min val QLIKE); "
+              f"testing over {len(SEEDS)} seeds")
+        for seed in SEEDS:
+            print(f"  [test] {family}(lb={best_lb}) seed={seed}...")
+            try:
+                p, y_te = fit(vol, targets, split, best_lb, seed=seed)
+                record_test(family, p, y_te, seed=seed, lookback=best_lb)
+            except Exception as e:
+                print(f"    ERROR: {e}")
+                all_results.append({"model": family, **NAN_METRICS, "period": period,
+                                    "seed": seed, "lookback": best_lb})
 
 # ============================================================
 # SUMMARY TABLES
 # ============================================================
+METRICS = ["RMSE", "QLIKE", "MZ_alpha", "MZ_beta", "MZ_R2"]
+ORDER   = [p for p in PERIOD_STARTS if p in PERIODS]
+
 df = pd.DataFrame(all_results)
-df = df[["period", "model", "RMSE", "QLIKE", "MZ_alpha", "MZ_beta", "MZ_R2"]]
+df = df[["period", "model", "lookback", "seed"] + METRICS]
+
+val_df = pd.DataFrame(val_results)[["period", "model", "lookback"] + METRICS]
+print(f"\n\n{'='*80}")
+print("  VALIDATION — lookback selection (min QLIKE per model family)")
+print(f"{'='*80}")
+print(val_df.pivot_table(values="QLIKE", index="period", columns=["model", "lookback"])
+      .reindex(ORDER).round(6).to_string())
+
+summary = (df.groupby(["period", "model"])
+             .agg(lookback=("lookback", "first"), n_seeds=("RMSE", "count"),
+                  **{f"{m}_{s}": (m, s) for m in METRICS for s in ("mean", "std")})
+             .reset_index())
 
 print(f"\n\n{'='*80}")
-print("  FULL RESULTS — RMSE/QLIKE in raw vol space | MZ in log vol space")
+print(f"  TEST — mean ± std over {len(SEEDS)} seeds (ESN/LSTM); "
+      f"single run (GARCH/HAR, deterministic)")
+print("  RMSE/QLIKE in raw vol space | MZ in log vol space")
 print(f"{'='*80}")
-print(df.to_string(index=False))
-
 for metric in ["RMSE", "QLIKE", "MZ_R2"]:
-    print(f"\n\n{'='*80}")
-    print(f"  PIVOT: {metric} by period × model")
-    print(f"{'='*80}")
-    pivot = df.pivot_table(values=metric, index="period", columns="model")
-    order = [p for p in PERIOD_STARTS if p in pivot.index]
-    print(pivot.loc[order].round(6).to_string())
+    fmt = summary.assign(
+        cell=summary[f"{metric}_mean"].map("{:.6f}".format)
+             + summary[f"{metric}_std"].map(lambda s: "" if np.isnan(s) else f" ± {s:.6f}")
+    )
+    print(f"\n  {metric} by period × model")
+    print(fmt.pivot(index="period", columns="model", values="cell").reindex(ORDER).to_string())
 
-# Best ESN and best LSTM per period
-print(f"\n\n{'='*80}")
-print("  BEST ESN per period (min RMSE across lookbacks)")
-print(f"{'='*80}")
-esn_df = df[df['model'].str.startswith('ESN')]
-best_esn = esn_df.loc[esn_df.groupby('period')['RMSE'].idxmin()]
-print(best_esn[['period','model','RMSE','QLIKE','MZ_beta','MZ_R2']].to_string(index=False))
-
-print(f"\n\n{'='*80}")
-print("  BEST LSTM per period (min RMSE across lookbacks)")
-print(f"{'='*80}")
-lstm_df = df[df['model'].str.startswith('LSTM')]
-best_lstm = lstm_df.loc[lstm_df.groupby('period')['RMSE'].idxmin()]
-print(best_lstm[['period','model','RMSE','QLIKE','MZ_beta','MZ_R2']].to_string(index=False))
-
-df.to_csv("benchmark_logvol_results.csv", index=False)
-print(f"\n  Saved to: benchmark_logvol_results.csv")
+df.to_csv(RESULTS_FILE, index=False)
+summary.to_csv(SUMMARY_FILE, index=False)
+val_df.to_csv(VAL_FILE, index=False)
+pd.DataFrame(all_predictions).to_csv(PREDICTIONS_FILE, index=False)
+print(f"\n  Saved: {RESULTS_FILE} (per seed), {SUMMARY_FILE} (mean/std), "
+      f"{VAL_FILE} (validation), {PREDICTIONS_FILE} (forecasts for dm_test.py)")
 print(f"\n  Lookback note:")
 print(f"    lb=1  → single-step input (ESN original, recurrent memory intact)")
 print(f"    lb=5  → matches QRC raw lookback")
 print(f"    lb=7  → matches QRC effective memory (lookback + hankel_window - 1)")
 print(f"    lb=21 → standard ~1-month financial window")
-

@@ -4,7 +4,7 @@ experiment_finance_hardware_SPY.py
 
 Pipeline (Hardware Version - Multi-Reservoir)
 ---------------------------------------------
-  1. Download price data via yfinance
+  1. Load price data from the local snapshot (market_data.py)
   2. Compute daily returns and rolling log-volatility targets
   3. Build quantum circuits for multiple reservoirs and extract features via IBM hardware (EstimatorV2)
   4. Apply Hankel stacking on concatenated latent features
@@ -15,7 +15,6 @@ Pipeline (Hardware Version - Multi-Reservoir)
 import warnings
 import numpy as np
 import statsmodels.api as sm
-import yfinance as yf
 from sklearn.linear_model import RidgeCV
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
@@ -27,6 +26,7 @@ from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
 
 # Only import these two utilities from qrc_core (no QuantumReservoir needed)
 from qrc_core import build_observables, apply_hankel
+from market_data import DATA_DIR, load_close
 
 warnings.filterwarnings("ignore")
 
@@ -46,6 +46,7 @@ CFG = {
     "seed":             42,
     "shots":            1024,        # Shots per circuit on hardware
     "data_period":      "4y",
+    "data_dir":         DATA_DIR,    # price snapshots (see market_data.py)
 }
 
 PERIOD_STARTS = {
@@ -106,18 +107,9 @@ print(f"\n  Observables per circuit : {N_OBS} "
 # DATA
 # ============================================================
 def get_market_data():
-    """Download market data and return (returns, log_vol_targets)."""
-    df = yf.download(
-        CFG["ticker"],
-        start=PERIOD_STARTS[CFG["data_period"]],
-        end=END_DATE,
-        interval="1d",
-        progress=False,
-    )
-    if df.empty:
-        raise ValueError(f"No data for {CFG['ticker']}.")
-
-    close      = df["Close"].values.flatten()
+    """Load market data from the local snapshot and return (returns, log_vol_targets)."""
+    close      = load_close(CFG["ticker"], PERIOD_STARTS[CFG["data_period"]],
+                            END_DATE, CFG["data_dir"]).values
     returns    = np.diff(close) / close[:-1]
 
     vol_window = 5
