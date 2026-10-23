@@ -294,6 +294,19 @@ def load_existing_results(filepath: str = None) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def save_checkpoint(df: pd.DataFrame, filepath: str) -> None:
+    """Write to a temp file then rename, so a crash mid-write never corrupts the checkpoint."""
+    tmp = filepath + ".tmp"
+    df.to_csv(tmp, index=False)
+    for _ in range(5):
+        try:
+            os.replace(tmp, filepath)
+            return
+        except PermissionError:   # Windows: target briefly open elsewhere (Excel, a monitoring read)
+            time.sleep(1)
+    print(f"  WARNING: {filepath} is locked; latest checkpoint left in {tmp}")
+
+
 def already_done(existing_df: pd.DataFrame, period, n_layers, n_reservoirs) -> bool:
     if existing_df.empty:
         return False
@@ -318,6 +331,12 @@ def run_grid_search() -> pd.DataFrame:
     ))
     total       = len(combos)
     existing_df = load_existing_results()
+    if not existing_df.empty:
+        # Failed configs are checkpointed with NaN scores; drop them so they are retried
+        failed = existing_df["val_qlike"].isna()
+        if failed.any():
+            print(f"  Retrying {failed.sum()} previously failed config(s)")
+            existing_df = existing_df[~failed].reset_index(drop=True)
     results     = existing_df.to_dict("records") if not existing_df.empty else []
 
     done_count = sum(
@@ -370,7 +389,7 @@ def run_grid_search() -> pd.DataFrame:
             })
 
         # Checkpoint after every run
-        pd.DataFrame(results).to_csv(RESULTS_FILE, index=False)
+        save_checkpoint(pd.DataFrame(results), RESULTS_FILE)
 
     return pd.DataFrame(results)
 
@@ -407,6 +426,10 @@ def run_champion_evaluation() -> pd.DataFrame:
     rows      = existing.to_dict("records") if not existing.empty else []
     prev_pred = load_existing_results(PREDICTIONS_FILE)
     pred_rows = prev_pred.to_dict("records") if not prev_pred.empty else []
+    # The seeds file is written last, so it marks which replicates are complete;
+    # drop forecasts of any replicate interrupted between the two writes.
+    done      = set(zip(existing["period"], existing["replicate"])) if not existing.empty else set()
+    pred_rows = [r for r in pred_rows if (r["period"], r["seed"]) in done]
 
     print(f"\n  Test evaluation: refit on train+val, {N_EVAL_SEEDS} seed replicates\n")
     for _, c in champions.iterrows():
@@ -447,9 +470,9 @@ def run_champion_evaluation() -> pd.DataFrame:
                 for d, yt, yp in zip(dates[test_start:], y[test_start:], preds)
             )
 
-            # Checkpoint after every replicate
-            pd.DataFrame(rows).to_csv(CHAMPION_SEEDS_FILE, index=False)
-            pd.DataFrame(pred_rows).to_csv(PREDICTIONS_FILE, index=False)
+            # Checkpoint after every replicate (forecasts first; the seeds file marks completion)
+            save_checkpoint(pd.DataFrame(pred_rows), PREDICTIONS_FILE)
+            save_checkpoint(pd.DataFrame(rows), CHAMPION_SEEDS_FILE)
 
     return pd.DataFrame(rows)
 
@@ -507,7 +530,7 @@ def print_champion_summary(df: pd.DataFrame) -> None:
     summary = summary.reset_index()
     summary["period"] = pd.Categorical(summary["period"], list(PERIOD_STARTS), ordered=True)
     summary = summary.sort_values("period")
-    summary.to_csv(CHAMPION_SUMMARY_FILE, index=False)
+    save_checkpoint(summary, CHAMPION_SUMMARY_FILE)
 
     print(f"\n{'='*60}")
     print(f"  CHAMPION TEST RESULTS — {CFG['ticker']} | mean ± std over seed replicates")
