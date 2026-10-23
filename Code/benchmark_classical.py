@@ -20,6 +20,7 @@
 # Prices come from the local snapshot in market_data.py ({data_dir}/{ticker}_close.csv).
 
 import argparse
+import sys
 import numpy as np
 import pandas as pd
 import warnings
@@ -28,6 +29,10 @@ from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import StandardScaler
 
 from market_data import DATA_DIR, load_close
+
+# UTF-8 stdout: progress output uses → / ±, which crash a cp1252 Windows console
+# or redirected log; line buffering keeps log files current during long runs.
+sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
 warnings.filterwarnings('ignore')
 

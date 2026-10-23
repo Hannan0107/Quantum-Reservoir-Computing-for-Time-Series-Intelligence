@@ -12,6 +12,7 @@ Pipeline (Hardware Version - Multi-Reservoir)
   6. Evaluate: RMSE, QLIKE, Mincer-Zarnowitz (alpha, beta, R2)
 """
 
+import sys
 import warnings
 import numpy as np
 import statsmodels.api as sm
@@ -27,6 +28,10 @@ from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
 # Only import these two utilities from qrc_core (no QuantumReservoir needed)
 from qrc_core import build_observables, apply_hankel
 from market_data import DATA_DIR, load_close
+
+# UTF-8 stdout: progress output uses → / ±, which crash a cp1252 Windows console
+# or redirected log; line buffering keeps log files current during long runs.
+sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
 warnings.filterwarnings("ignore")
 

@@ -22,9 +22,14 @@ CLI (create snapshots up front, before launching runs in parallel):
 
 import argparse
 import os
+import sys
 
 import pandas as pd
 import yfinance as yf
+
+# UTF-8 stdout: progress output uses → / ±, which crash a cp1252 Windows console
+# or redirected log; line buffering keeps log files current during long runs.
+sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
 SNAPSHOT_START = "2015-04-27"   # earliest period start used by the experiments (10y)
 END_DATE       = "2025-01-01"

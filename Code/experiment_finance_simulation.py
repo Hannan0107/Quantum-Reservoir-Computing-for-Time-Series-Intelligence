@@ -43,6 +43,7 @@ import argparse
 import glob
 import itertools
 import os
+import sys
 import time
 import warnings
 
@@ -56,6 +57,10 @@ from sklearn.preprocessing import StandardScaler
 
 from market_data import DATA_DIR, load_close
 from qrc_core import QuantumReservoir, prepare_hankel_features
+
+# UTF-8 stdout: progress output uses → / ±, which crash a cp1252 Windows console
+# or redirected log; line buffering keeps log files current during long runs.
+sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
 warnings.filterwarnings("ignore")
 
